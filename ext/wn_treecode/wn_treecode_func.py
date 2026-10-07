@@ -118,7 +118,31 @@ class WindingNumberTreecode:
 
         return out_vecs
 
-    def forward_Au(self, normals, tf_values, tf_grads, test_function, epsilon):
+    def prepare_Au(self, field):
+        """Prepare node attributes for one input field, shared across probes.
+
+        The returned tensors are only valid while the field and tree stay
+        unchanged; prepare them again for every new operator input.
+        """
+        assert field.shape == self.points.shape
+        point_weights = (field ** 2).sum(-1).sqrt()
+        node_attrs, node_reppoints, _ = (
+            self.treecode_package.scatter_point_attrs_to_nodes(
+                self.node_parent_list,
+                self.node_children_list,
+                self.points,
+                point_weights,
+                field,
+                self.node2point_index,
+                self.node2point_indexstart,
+                self.num_points_in_node,
+                self.node_is_leaf_list,
+                self.tree_depth,
+            )
+        )
+        return node_attrs, node_reppoints
+
+    def forward_Au(self, normals, tf_values, tf_grads, test_function, epsilon, prepared_nodes):
         """
         Forward operator A[u]
         
@@ -126,6 +150,7 @@ class WindingNumberTreecode:
         tf_values: [N,] or [N, 1]
         tf_grads: [N, 3]
         epsilon: float
+        prepared_nodes: result of prepare_Au(normals) for this field
         """
         assert self.points.shape == normals.shape
         assert tf_values.shape[0] == self.points.shape[0]
@@ -135,18 +160,7 @@ class WindingNumberTreecode:
         else:
             assert tf_values.dim() == 2 and tf_values.shape[1] == 1
 
-        point_weights = (normals ** 2).sum(-1).sqrt()
-        node_normals, node_reppoints, _ = \
-            self.treecode_package.scatter_point_attrs_to_nodes(self.node_parent_list,
-                                                    self.node_children_list,
-                                                    self.points,
-                                                    point_weights,
-                                                    normals,
-                                                    self.node2point_index,
-                                                    self.node2point_indexstart,
-                                                    self.num_points_in_node,
-                                                    self.node_is_leaf_list,
-                                                    self.tree_depth)
+        node_normals, node_reppoints = prepared_nodes
 
         node_tf_values = test_function.eval_func(node_reppoints)
         node_tf_grads = test_function.eval_grad(node_reppoints)

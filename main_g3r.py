@@ -5,11 +5,39 @@ from time import time
 from tqdm import tqdm
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 import wn_treecode
 
 from g3r.harmonic_library import build_harmonic_library
+
+
+def morton_order(points: np.ndarray, depth: int = 15) -> np.ndarray:
+    """Return sorted-index -> original-index, preserving ties in input order.
+
+    Each octant uses x + 2*y + 4*z, matching the existing CPU tree builder.
+    Float64 quantization preserves split-plane decisions for float32 inputs.
+    Points on the upper root boundary belong to the last cell.
+    """
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+    if not 1 <= depth <= 21:
+        raise ValueError("depth must be between 1 and 21 for uint64 codes")
+    if not np.isfinite(points).all() or (np.abs(points) > 1).any():
+        raise ValueError("points must be finite and inside [-1, 1]^3")
+    cells = 1 << depth
+    # Floor before adding the integer offset: adding 1 to a tiny negative
+    # coordinate first can round it onto the x/y/z=0 splitting plane.
+    grid = np.minimum(
+        np.floor(points.astype(np.float64) * (cells / 2)) + cells // 2,
+        cells - 1,
+    ).astype(np.uint64)
+    codes = np.zeros(len(points), dtype=np.uint64)
+    for bit in range(depth):
+        for axis in range(3):
+            codes |= ((grid[:, axis] >> bit) & 1) << (3 * bit + axis)
+    return np.argsort(codes, kind="stable")
+
 
 time_start = time()
 
@@ -34,6 +62,8 @@ parser.add_argument(
 )
 parser.add_argument('--out_dir', type=str, default='results')
 parser.add_argument('--cpu', action='store_true', help='use cpu code only')
+parser.add_argument('--morton-order', action=argparse.BooleanOptionalAction, default=True,
+                    help='sort points on CPU before solving (default: enabled)')
 parser.add_argument('--tqdm', action='store_true', help='use tqdm bar')
 parser.add_argument('--log', action='store_true', help='log the results to a file, default is not to log')
 args = parser.parse_args()
@@ -90,6 +120,18 @@ bbox_center = (points_unnormalized.min(0) + points_unnormalized.max(0)) / 2.
 bbox_len = (points_unnormalized.max(0) - points_unnormalized.min(0)).max()
 points_normalized = (points_unnormalized - bbox_center) * (2 / (bbox_len * bbox_scale))
 
+morton_permutation = None
+morton_sort_seconds = 0.0
+if args.morton_order:
+    morton_start = time()
+    # Use the same float32 positions as the tree and CUDA kernels.
+    points_normalized = points_normalized.astype(np.float32)
+    morton_permutation = morton_order(points_normalized)
+    points_normalized = points_normalized[morton_permutation]
+    if normals_groundtruth is not None:
+        normals_groundtruth = normals_groundtruth[torch.from_numpy(morton_permutation)]
+    morton_sort_seconds = time() - morton_start
+
 points_normalized = torch.from_numpy(points_normalized).contiguous().float()
 normals = torch.zeros_like(points_normalized)
 
@@ -113,6 +155,7 @@ if args.log:
         f"Epsilon: {args.epsilon}",
         f"Test Functions: {args.test_funcs}",
         f"CPU Only: {args.cpu}",
+        f"Morton Order: {args.morton_order}",
         f"Iteration Log:\n"
     ]
     with open(log_file_path, 'w') as log_file:
@@ -146,25 +189,24 @@ for tf in test_functions:
     })
 
 
-def _apply_Au(spec: dict, field: torch.Tensor) -> torch.Tensor:
-    return wn_func.forward_Au(field, spec["values"], spec["grads"], spec["tf"], epsilon)
-
-
-def _apply_AuT(spec: dict, values: torch.Tensor) -> torch.Tensor:
-    return wn_func.forward_AuT(values, spec["values"], spec["grads"], epsilon)
-
-
 def AutAu_operator(v: torch.Tensor) -> torch.Tensor:
-    return torch.stack([
-        _apply_AuT(spec, _apply_Au(spec, v))
-        for spec in test_specs
-    ]).sum(dim=0)
+    prepared_nodes = wn_func.prepare_Au(v)
+    result = torch.zeros_like(v)
+    for spec in test_specs:
+        values = wn_func.forward_Au(
+            v, spec["values"], spec["grads"], spec["tf"], epsilon, prepared_nodes,
+        )
+        result.add_(wn_func.forward_AuT(
+            values, spec["values"], spec["grads"], epsilon,
+        ))
+    return result
 
 with torch.no_grad():
-    AuT_u_hat = torch.stack([
-        _apply_AuT(spec, spec["smoothed"])
-        for spec in test_specs
-    ]).sum(dim=0)
+    AuT_u_hat = torch.zeros_like(normals)
+    for spec in test_specs:
+        AuT_u_hat.add_(wn_func.forward_AuT(
+            spec["smoothed"], spec["values"], spec["grads"], epsilon,
+        ))
     b = AuT_u_hat / 2.0
 
     r = b - AutAu_operator(normals)
@@ -248,10 +290,16 @@ if wn_func.is_cuda:
 
 time_iter_end = time()
 print(f'[LOG] time_preproc: {time_iter_start - time_preprocess_start}')
+print(f'[LOG] time_morton_sort: {morton_sort_seconds}')
 print(f'[LOG] time_main: {time_iter_end - time_iter_start}')
 
 with torch.no_grad():
-    out_points_normals = np.concatenate([points_unnormalized, out_normals.detach().cpu().numpy()], -1) # type: ignore
+    out_normals_numpy = out_normals.detach().cpu().numpy()
+    if morton_permutation is not None:
+        restored_normals = np.empty_like(out_normals_numpy)
+        restored_normals[morton_permutation] = out_normals_numpy
+        out_normals_numpy = restored_normals
+    out_points_normals = np.concatenate([points_unnormalized, out_normals_numpy], -1) # type: ignore
     np.savetxt(out_file_path, out_points_normals)
 
 process = psutil.Process(os.getpid())
